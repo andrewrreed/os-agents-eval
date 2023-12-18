@@ -1,0 +1,14 @@
+transformers
+langchain
+text-generation
+python-dotenv
+jinja2
+google-search-results
+langchainhub
+numexpr
+datasets
+tqdm
+openai
+sentencepiece
+protobuf
+matplotlib
