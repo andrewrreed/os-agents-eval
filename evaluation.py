@@ -93,6 +93,12 @@ async def run_agent_eval(
         exception = e
 
     end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    tools_used = (
+        [step[0].tool for step in out["intermediate_steps"]]
+        if out["intermediate_steps"] is not None
+        else None
+    )
     # collect results
     return {
         "agent_model_id": agent_executor.dict()["agent"]["runnable"]["middle"][-1][
@@ -110,6 +116,13 @@ async def run_agent_eval(
         "agent_error": exception if "exception" in locals() else None,
         "start_time": start_time,
         "end_time": end_time,
+        "tools_used": tools_used,
+        "number_distinct_tools_used": len(list(set(tools_used)))
+        if tools_used is not None
+        else None,
+        "number_of_steps": len(out["intermediate_steps"])
+        if out["intermediate_steps"] is not None
+        else None,
     }
 
 
@@ -148,9 +161,7 @@ async def evaluate_on_dataset(
         # add in example metadata
         result.update(
             {
-                "id": example["id"],
-                "type": example["type"],
-                "level": example["level"],
+                "task": example["task"],
             }
         )
         results.append(result)
