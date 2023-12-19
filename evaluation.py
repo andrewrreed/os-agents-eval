@@ -7,124 +7,12 @@ from typing import Any, Dict, List
 import pandas as pd
 from datasets import Dataset
 from chat_wrapper import HuggingFaceChatWrapper
-from langchain.agents import AgentExecutor, load_tools
-from langchain.agents.format_scratchpad import format_log_to_str
-from langchain.agents.output_parsers import (
-    ReActJsonSingleInputOutputParser,
-)
-from langchain.llms import (
-    HuggingFaceEndpoint,
-)
-from langchain.prompts.chat import (
-    ChatPromptTemplate,
-    HumanMessagePromptTemplate,
-    SystemMessagePromptTemplate,
-)
-from langchain.schema import (
-    SystemMessage,
-)
-from langchain.tools.render import render_text_description
-from prompts import HUMAN_PROMPT, EVALUATION_PROMPT, SYSTEM_PROMPT, CORRECTNESS_CRITERIA
+from langchain.agents import AgentExecutor
+
+from langchain.chat_models import ChatOpenAI
+
+from langchain.prompts.chat import ChatPromptTemplate
 from tqdm import tqdm
-
-
-def build_agent(hf_endpoint_url: str):
-    """
-    Build a zero-shot ReAct chat agent from HF endpoint.
-
-    Args:
-        hf_endpoint_url (str): The endpoint URL for the Hugging Face model.
-
-    Returns:
-        AgentExecutor: An agent executor object that can be used to run the agent.
-
-    """
-    # instantiate LLM and chat model
-    llm = HuggingFaceEndpoint(
-        endpoint_url=hf_endpoint_url,
-        task="text-generation",
-        model_kwargs={
-            "max_new_tokens": 512,
-            "do_sample": False,
-        },
-    )
-
-    chat_model = HuggingFaceChatWrapper(llm=llm)
-
-    # setup tools
-    tools = load_tools(["serpapi", "llm-math"], llm=llm)
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
-            HumanMessagePromptTemplate.from_template(HUMAN_PROMPT),
-        ]
-    )
-    prompt = prompt.partial(
-        tools=render_text_description(tools),
-        tool_names=", ".join([t.name for t in tools]),
-    )
-
-    # define the agent
-    chat_model_with_stop = chat_model.bind(stop=["\nObservation"])
-    agent = (
-        {
-            "input": lambda x: x["input"],
-            "agent_scratchpad": lambda x: format_log_to_str(x["intermediate_steps"]),
-        }
-        | prompt
-        | chat_model_with_stop
-        | ReActJsonSingleInputOutputParser()
-    )
-
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        return_intermediate_steps=True,
-        handle_parsing_errors=True,
-        max_iterations=5,
-    )
-
-
-def build_evaluator(hf_endpoint_url: str) -> tuple:
-    """
-    Build an evaluator language model using the given Hugging Face endpoint URL.
-
-    Args:
-        hf_endpoint_url (str): The URL of the Hugging Face endpoint.
-
-    Returns:
-        Tuple: A tuple containing the evaluator chat model and the correctness prompt template.
-    """
-    eval_llm = HuggingFaceEndpoint(
-        endpoint_url=hf_endpoint_url,
-        task="text-generation",
-        model_kwargs={
-            "max_new_tokens": 512,
-            "do_sample": False,
-        },
-    )
-
-    eval_chat_model = HuggingFaceChatWrapper(llm=eval_llm)
-
-    prometheus_prompt_template = ChatPromptTemplate.from_messages(
-        [
-            SystemMessage(content="You are a fair evaluator language model."),
-            HumanMessagePromptTemplate.from_template(EVALUATION_PROMPT),
-        ]
-    )
-
-    correctness_prompt_template = prometheus_prompt_template.partial(
-        criteria_description=CORRECTNESS_CRITERIA["criteria_description"],
-        score1_description=CORRECTNESS_CRITERIA["score1_description"],
-        score2_description=CORRECTNESS_CRITERIA["score2_description"],
-        score3_description=CORRECTNESS_CRITERIA["score3_description"],
-        score4_description=CORRECTNESS_CRITERIA["score4_description"],
-        score5_description=CORRECTNESS_CRITERIA["score5_description"],
-    )
-
-    return eval_chat_model, correctness_prompt_template
 
 
 async def run_agent_eval(
@@ -132,7 +20,8 @@ async def run_agent_eval(
     ground_truth_answer: str,
     agent_name: str,
     agent_executor: AgentExecutor,
-    evaluator: HuggingFaceChatWrapper,
+    prometheus_evaluator: HuggingFaceChatWrapper,
+    openai_evaluator: ChatOpenAI,
     eval_prompt_template: ChatPromptTemplate,
 ) -> dict:
     """
@@ -155,15 +44,22 @@ async def run_agent_eval(
         # run agent
         out = await agent_executor.ainvoke({"input": question})
 
-        # run evaluator
+        # run evaluation
         eval_prompt = eval_prompt_template.format_messages(
             instruction=question,
             response=out["output"],
             reference_answer=ground_truth_answer,
         )
-        eval_result = await evaluator.ainvoke(eval_prompt)
-        feedback, score = [
-            item.strip() for item in eval_result.content.split("[RESULT]")
+        ## prometheus evaluator
+        eval_result_prometheus = await prometheus_evaluator.ainvoke(eval_prompt)
+        feedback_prometheus, score_prometheus = [
+            item.strip() for item in eval_result_prometheus.content.split("[RESULT]")
+        ]
+
+        ## gpt4 evaluator
+        eval_result_openai = await openai_evaluator.ainvoke(eval_prompt)
+        feedback_openai, score_openai = [
+            item.strip() for item in eval_result_openai.content.split("[RESULT]")
         ]
 
         # check for parsing errors which indicate the LLM failed to follow the ReACT format
@@ -189,8 +85,7 @@ async def run_agent_eval(
 
     except Exception as e:
         out = {"output": None, "intermediate_steps": None}
-        score = None
-        feedback = None
+        score_prometheus = feedback_prometheus = score_openai = feedback_openai = None
         parsing_error = False
         iteration_limit_exceeded = False
         exception = e
@@ -215,24 +110,29 @@ async def run_agent_eval(
         if intermediate_steps is not None
         else None
     )
+    if (
+        agent_executor.dict()["agent"]["runnable"]["middle"][-1]["bound"]["_type"]
+        == "openai-chat"
+    ):
+        agent_model_id = agent_executor.dict()["agent"]["runnable"]["middle"][-1][
+            "bound"
+        ]["model_name"]
+    else:
+        agent_model_id = agent_executor.dict()["agent"]["runnable"]["middle"][-1][
+            "bound"
+        ]["_type"]
+
     # collect results
     return {
         "agent_name": agent_name,
-        "agent_model_id": agent_executor.dict()["agent"]["runnable"]["middle"][-1][
-            "bound"
-        ]["_type"],
-        "evaluator_model_id": evaluator.model_id,
+        "agent_model_id": agent_model_id,
         "question": question,
         "gt_answer": ground_truth_answer,
         "prediction": out["output"],
         "intermediate_steps": intermediate_steps,
-        "eval_score": score,
-        "eval_feedback": feedback,
         "parsing_error": parsing_error,
         "iteration_limit_exceeded": iteration_limit_exceeded,
         "agent_error": repr(exception) if raised_exception else None,
-        "start_time": start_time,
-        "end_time": end_time,
         "tools_used": tools_used,
         "number_distinct_tools_used": len(list(set(tools_used)))
         if tools_used is not None
@@ -240,6 +140,14 @@ async def run_agent_eval(
         "number_of_steps": len(intermediate_steps)
         if intermediate_steps is not None
         else None,
+        "prometheus_evaluator_model_id": prometheus_evaluator.model_id,
+        "eval_score_prometheus": score_prometheus,
+        "eval_feedback_prometheus": feedback_prometheus,
+        "openai_evaluator_model_id": openai_evaluator.model_name,
+        "eval_score_openai": score_openai,
+        "eval_feedback_openai": feedback_openai,
+        "start_time": start_time,
+        "end_time": end_time,
     }
 
 
@@ -247,7 +155,8 @@ async def evaluate_on_dataset(
     dataset: Dataset,
     agent_name: str,
     agent_executor: AgentExecutor,
-    evaluator: HuggingFaceChatWrapper,
+    prometheus_evaluator: HuggingFaceChatWrapper,
+    openai_evaluator: ChatOpenAI,
     eval_prompt_template: ChatPromptTemplate,
 ) -> List[Dict[str, Any]]:
     """
@@ -288,7 +197,8 @@ async def evaluate_on_dataset(
             ground_truth_answer=example["answer"],
             agent_name=agent_name,
             agent_executor=agent_executor,
-            evaluator=evaluator,
+            prometheus_evaluator=prometheus_evaluator,
+            openai_evaluator=openai_evaluator,
             eval_prompt_template=eval_prompt_template,
         )
 
@@ -302,7 +212,7 @@ async def evaluate_on_dataset(
 
         # save results
         if not os.path.exists(file_name):
-            os.makedirs(os.path.dirname(file_name))
+            os.makedirs(os.path.dirname(file_name), exist_ok=True)
         with open(file_name, "w") as f:
             json.dump(results, f)
 
@@ -311,8 +221,9 @@ async def evaluate_on_dataset(
 
 async def run_full_eval(
     dataset: Dataset,
-    agent_model_endpoints: Dict[str, str],
-    evaluator: HuggingFaceChatWrapper,
+    agents: Dict[str, AgentExecutor],
+    prometheus_evaluator: HuggingFaceChatWrapper,
+    openai_evaluator: ChatOpenAI,
     eval_prompt_template: ChatPromptTemplate,
 ) -> pd.DataFrame:
     """
@@ -329,17 +240,13 @@ async def run_full_eval(
     """
     results = []
 
-    # agent_executors = [build_agent(endpoint) for endpoint in agent_model_endpoints]
-    agents = {
-        name: build_agent(endpoint) for name, endpoint in agent_model_endpoints.items()
-    }
-
     tasks = [
         evaluate_on_dataset(
             dataset=dataset,
             agent_name=agent_name,
             agent_executor=agent_executor,
-            evaluator=evaluator,
+            prometheus_evaluator=prometheus_evaluator,
+            openai_evaluator=openai_evaluator,
             eval_prompt_template=eval_prompt_template,
         )
         for agent_name, agent_executor in agents.items()
