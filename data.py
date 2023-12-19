@@ -1,4 +1,4 @@
-import pandas as pd
+import numpy as np
 from datasets import Dataset, load_dataset, concatenate_datasets
 
 
@@ -24,10 +24,18 @@ def build_dataset() -> Dataset:
         ["question", "answer", "task"]
     )
 
-    gaia_dataset = load_dataset("gaia-benchmark/GAIA", "2023_level1")["validation"]
+    # gsm8k dataset
+    np.random.seed(42)
+    math_dataset = load_dataset("gsm8k", "main")["train"]
+    math_dataset = math_dataset.select(np.random.randint(0, len(math_dataset), 15))
+    task_column = ["GSM8K"] * len(math_dataset)
+    math_dataset = math_dataset.add_column("task", task_column).select_columns(
+        ["question", "answer", "task"]
+    )
 
     # gaia dataset
     # we'll manually select "easy" examples that can be solved with search and calculator tools
+    gaia_dataset = load_dataset("gaia-benchmark/GAIA", "2023_level1")["validation"]
     gaia_dataset.set_format("pandas")
     gaia_dataset_df = gaia_dataset[:]
     gaia_dataset_df["number_of_steps"] = gaia_dataset_df["Annotator Metadata"].apply(
@@ -54,7 +62,7 @@ def build_dataset() -> Dataset:
     gaia_dataset = gaia_dataset.add_column("task", task_column)
 
     # combine and add id's
-    dataset = concatenate_datasets([hotpotqa_dataset, gaia_dataset])
+    dataset = concatenate_datasets([hotpotqa_dataset, math_dataset, gaia_dataset])
 
     def add_index(example, idx):
         return {**example, "id": idx}
