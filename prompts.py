@@ -1,3 +1,11 @@
+from langchain.schema import (
+    SystemMessage,
+)
+from langchain.prompts.chat import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+)
+
 SYSTEM_PROMPT = """Answer the following questions as best you can. You have access to the following tools:
 
 {tools}
@@ -70,3 +78,21 @@ CORRECTNESS_CRITERIA = {
     "score4_description": "The response is mostly correct, accurate, and factual.",
     "score5_description": "The response is completely correct, accurate, and factual.",
 }
+
+
+def build_eval_prompt():
+    prometheus_prompt_template = ChatPromptTemplate.from_messages(
+        [
+            SystemMessage(content="You are a fair evaluator language model."),
+            HumanMessagePromptTemplate.from_template(EVALUATION_PROMPT),
+        ]
+    )
+
+    return prometheus_prompt_template.partial(
+        criteria_description=CORRECTNESS_CRITERIA["criteria_description"],
+        score1_description=CORRECTNESS_CRITERIA["score1_description"],
+        score2_description=CORRECTNESS_CRITERIA["score2_description"],
+        score3_description=CORRECTNESS_CRITERIA["score3_description"],
+        score4_description=CORRECTNESS_CRITERIA["score4_description"],
+        score5_description=CORRECTNESS_CRITERIA["score5_description"],
+    )
